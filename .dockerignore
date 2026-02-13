@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+*.md
+*.bat
+*.sh
+*.ipynb
+docker-compose*.yml
+Dockerfile.*
+requirements*.txt
+hf_cache/
+model_cache/
+outputs/
+logs/

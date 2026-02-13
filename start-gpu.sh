@@ -1,0 +1,34 @@
+#!/bin/bash
+# Start Chatterbox TTS with GPU acceleration on Jetson Orin Nano
+#
+# Fixes applied:
+# 1. Mount host Jetson-native cuBLAS/cuDNN/cuFFT (container ships SBSA builds)
+# 2. STFT/ISTFT monkey-patch for non-power-of-2 FFT sizes via sitecustomize.py
+
+CUBLAS_HOST=/usr/local/cuda/targets/aarch64-linux/lib
+CUBLAS_CTR=/usr/local/cuda/targets/sbsa-linux/lib
+CUDNN_HOST=/lib/aarch64-linux-gnu
+CUDNN_CTR=/usr/lib/aarch64-linux-gnu
+
+docker run -d --name chatterbox-tts \
+  --runtime nvidia --network host \
+  --restart unless-stopped \
+  -e HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN environment variable or edit this script} \
+  -e PYTHONPATH=/app/patches \
+  -v chatterbox-models:/app/hf_cache \
+  -v chatterbox-outputs:/app/outputs \
+  -v ~/chatterbox-jetson/config.yaml:/app/config.yaml:ro \
+  -v ~/chatterbox-jetson/patches:/app/patches:ro \
+  -v ${CUBLAS_HOST}/libcublas.so.12.6.1.4:${CUBLAS_CTR}/libcublas.so.12.6.4.1:ro \
+  -v ${CUBLAS_HOST}/libcublasLt.so.12.6.1.4:${CUBLAS_CTR}/libcublasLt.so.12.6.4.1:ro \
+  -v ${CUBLAS_HOST}/libcufft.so.11.2.6.59:${CUBLAS_CTR}/libcufft.so.11.3.0.4:ro \
+  -v ${CUBLAS_HOST}/libcufftw.so.11.2.6.59:${CUBLAS_CTR}/libcufftw.so.11.3.0.4:ro \
+  -v ${CUDNN_HOST}/libcudnn.so.9.3.0:${CUDNN_CTR}/libcudnn.so.9.5.1:ro \
+  -v ${CUDNN_HOST}/libcudnn_adv.so.9.3.0:${CUDNN_CTR}/libcudnn_adv.so.9.5.1:ro \
+  -v ${CUDNN_HOST}/libcudnn_cnn.so.9.3.0:${CUDNN_CTR}/libcudnn_cnn.so.9.5.1:ro \
+  -v ${CUDNN_HOST}/libcudnn_engines_precompiled.so.9.3.0:${CUDNN_CTR}/libcudnn_engines_precompiled.so.9.5.1:ro \
+  -v ${CUDNN_HOST}/libcudnn_engines_runtime_compiled.so.9.3.0:${CUDNN_CTR}/libcudnn_engines_runtime_compiled.so.9.5.1:ro \
+  -v ${CUDNN_HOST}/libcudnn_graph.so.9.3.0:${CUDNN_CTR}/libcudnn_graph.so.9.5.1:ro \
+  -v ${CUDNN_HOST}/libcudnn_heuristic.so.9.3.0:${CUDNN_CTR}/libcudnn_heuristic.so.9.5.1:ro \
+  -v ${CUDNN_HOST}/libcudnn_ops.so.9.3.0:${CUDNN_CTR}/libcudnn_ops.so.9.5.1:ro \
+  chatterbox-tts-jetson

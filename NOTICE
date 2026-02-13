@@ -1,0 +1,27 @@
+Chatterbox TTS on NVIDIA Jetson
+Copyright 2026 Simon (muttleydosomething)
+
+This project was developed collaboratively by Simon and Claude (Anthropic's
+Claude Opus 4.6 via Claude Code). The SBSA library discovery, fp16 memory
+optimization, and cuFFT workarounds were developed through an extended
+debugging session spanning three days.
+
+This project includes or depends on the following third-party components:
+
+- Chatterbox TTS (https://github.com/resemble-ai/chatterbox)
+  Copyright Resemble AI
+  Licensed under the MIT License
+
+- Chatterbox TTS Server (https://github.com/devnen/chatterbox-tts-server)
+  Server application code (server.py, engine.py, config.py, models.py, utils.py)
+
+- PyTorch (https://pytorch.org/)
+  Copyright Meta Platforms, Inc. and affiliates
+  Licensed under the BSD 3-Clause License
+
+- NVIDIA CUDA Toolkit
+  Copyright NVIDIA Corporation
+  Subject to NVIDIA's CUDA EULA
+
+- Jetson AI Lab PyTorch Wheels (https://www.jetson-ai-lab.com/)
+  Copyright NVIDIA Corporation
