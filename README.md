@@ -2,7 +2,7 @@
 
 **The first GPU-accelerated Chatterbox TTS container for Jetson Orin Nano.**
 
-Text-to-speech with voice cloning, running entirely on a $249 edge AI device. ~4 seconds per utterance on GPU, with an OpenAI-compatible API.
+Text-to-speech with voice cloning, running entirely on a $249 edge AI device. ~4 seconds per utterance on GPU, with an OpenAI-compatible API. Pairs with [Whisper STT](https://github.com/muttleydosomething/whisper-stt-jetson) for a complete voice I/O stack on Jetson.
 
 | | |
 |---|---|
@@ -293,6 +293,12 @@ Building this required solving 11 technical problems with no existing documentat
 9. **C++ compilation** — `praat-parselmouth` needs cmake + ninja + python3.10-dev (~33 min build)
 10. **Transitive dependencies** — 6 packages missed by `--no-deps` install, found iteratively
 11. **FP16 memory optimization** — fp32 model OOMs during attention; auto-convert to fp16 with autocast
+
+---
+
+## See Also
+
+- **[Whisper STT on Jetson](https://github.com/muttleydosomething/whisper-stt-jetson)** — GPU-accelerated speech-to-text using whisper.cpp. Runs alongside Chatterbox on the same Orin Nano for a complete voice I/O stack (TTS on port 8004, STT on port 8005).
 
 ---
 
