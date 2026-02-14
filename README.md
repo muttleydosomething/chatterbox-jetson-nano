@@ -35,7 +35,16 @@ This project provides a complete, working solution: a Docker image, runtime patc
 - Docker with `nvidia-container-runtime`
 - A [HuggingFace token](https://huggingface.co/settings/tokens) (free — the model is public but the library requires authentication)
 
-### 1. Build the image
+### 1. Get the image
+
+**Option A: Pull pre-built (recommended)**
+
+```bash
+docker pull ghcr.io/muttleydosomething/chatterbox-tts-jetson:latest
+docker tag ghcr.io/muttleydosomething/chatterbox-tts-jetson:latest chatterbox-tts-jetson
+```
+
+**Option B: Build from source (~35 min)**
 
 ```bash
 git clone https://github.com/muttleydosomething/chatterbox-jetson-nano.git
@@ -43,7 +52,7 @@ cd chatterbox-jetson
 docker build -t chatterbox-tts-jetson .
 ```
 
-Build takes ~35 minutes (most of that is `praat-parselmouth` compiling C++ from source).
+Building from source takes ~35 minutes (most of that is `praat-parselmouth` compiling C++ from source).
 
 ### 2. Start with GPU acceleration
 
