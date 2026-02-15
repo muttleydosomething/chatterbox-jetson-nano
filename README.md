@@ -202,7 +202,7 @@ Example: `"And then I realized [laugh] it was the wrong library architecture the
 chatterbox-jetson/
 ├── Dockerfile              # Complete build recipe
 ├── start-gpu.sh            # GPU startup with SBSA library mounts
-├── config.yaml             # Server configuration
+├── config.yaml             # Server configuration (writable at runtime)
 ├── patches/
 │   └── sitecustomize.py    # FFT CPU routing + fp16 conversion + autocast
 ├── server.py               # Chatterbox TTS Server (FastAPI)
@@ -213,8 +213,16 @@ chatterbox-jetson/
 ├── static/                 # Web UI static assets
 ├── ui/                     # Web UI templates
 ├── reference_audio/        # Sample reference audio for voice cloning
-└── voices/                 # Predefined voice files
+└── voices/                 # Predefined voice files (28 built-in voices)
 ```
+
+### Runtime File Mounts
+
+The `start-gpu.sh` script mounts three files/directories as writable, so you can customize them without rebuilding the image:
+
+- **`config.yaml`** — Server settings. Editable via the web UI at `http://<jetson-ip>:8004/` (settings page).
+- **`server.py`** — The FastAPI server. Mount a modified copy to change defaults (e.g., default voice) without rebuilding.
+- **`voices/`** — Voice reference WAV files. Drop new `.wav` files here and they appear in the web UI and API immediately.
 
 ---
 
@@ -296,9 +304,26 @@ Building this required solving 11 technical problems with no existing documentat
 
 ---
 
+## Running Alongside Whisper STT
+
+This project is designed to run alongside [Whisper STT](https://github.com/muttleydosomething/whisper-stt-jetson) on the same Jetson, creating a complete voice I/O stack:
+
+| Port | Service | Endpoint | Function |
+|------|---------|----------|----------|
+| 8004 | Chatterbox TTS | `POST /v1/audio/speech` | Text to speech |
+| 8005 | Whisper STT | `POST /v1/audio/transcriptions` | Speech to text |
+
+### Startup Order Matters
+
+**Chatterbox must load first.** It uses PyTorch which needs a large contiguous GPU allocation (~5.5 GiB in fp16). If Whisper grabs GPU memory first, Chatterbox's `cudaMalloc` will fail with `NVML_SUCCESS == r INTERNAL ASSERT FAILED`.
+
+The [Whisper STT repo](https://github.com/muttleydosomething/whisper-stt-jetson) includes a `borg-ai-services.sh` boot orchestration script and a systemd unit that handles this automatically — starting Chatterbox first, waiting for model load, then starting Whisper.
+
+---
+
 ## See Also
 
-- **[Whisper STT on Jetson](https://github.com/muttleydosomething/whisper-stt-jetson)** — GPU-accelerated speech-to-text using whisper.cpp. Runs alongside Chatterbox on the same Orin Nano for a complete voice I/O stack (TTS on port 8004, STT on port 8005).
+- **[Whisper STT on Jetson](https://github.com/muttleydosomething/whisper-stt-jetson)** — GPU-accelerated speech-to-text using whisper.cpp. Runs alongside Chatterbox on the same Orin Nano for a complete voice I/O stack (TTS on port 8004, STT on port 8005). Includes boot orchestration scripts for reliable startup.
 
 ---
 

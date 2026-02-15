@@ -4,6 +4,7 @@
 # Fixes applied:
 # 1. Mount host Jetson-native cuBLAS/cuDNN/cuFFT (container ships SBSA builds)
 # 2. STFT/ISTFT monkey-patch for non-power-of-2 FFT sizes via sitecustomize.py
+# 3. Mount config.yaml (writable), server.py, and voices/ for runtime customization
 
 CUBLAS_HOST=/usr/local/cuda/targets/aarch64-linux/lib
 CUBLAS_CTR=/usr/local/cuda/targets/sbsa-linux/lib
@@ -17,7 +18,9 @@ docker run -d --name chatterbox-tts \
   -e PYTHONPATH=/app/patches \
   -v chatterbox-models:/app/hf_cache \
   -v chatterbox-outputs:/app/outputs \
-  -v ~/chatterbox-jetson/config.yaml:/app/config.yaml:ro \
+  -v ~/chatterbox-jetson/config.yaml:/app/config.yaml \
+  -v ~/chatterbox-jetson/server.py:/app/server.py \
+  -v ~/chatterbox-jetson/voices:/app/voices \
   -v ~/chatterbox-jetson/patches:/app/patches:ro \
   -v ${CUBLAS_HOST}/libcublas.so.12.6.1.4:${CUBLAS_CTR}/libcublas.so.12.6.4.1:ro \
   -v ${CUBLAS_HOST}/libcublasLt.so.12.6.1.4:${CUBLAS_CTR}/libcublasLt.so.12.6.4.1:ro \
