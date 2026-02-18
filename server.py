@@ -556,37 +556,26 @@ async def reset_settings_endpoint():
 )
 async def restart_server_endpoint():
     """
-    Triggers a hot-swap of the TTS model engine.
-    Unloads the current model, clears VRAM, and loads the model defined in config.
+    Triggers a clean process restart via os._exit(1).
+
+    In-process model hot-swap (reload_model) is not safe on Jetson unified memory:
+    deleting the model and re-loading from_pretrained on the same fragmented NvMap
+    heap reliably OOMs. Instead we exit with a non-zero code and let the
+    chatterbox-watchdog.service drop page caches from the host then restart cleanly.
     """
-    logger.info("Request received for /restart_server (Model Hot-Swap).")
+    import asyncio
+    logger.warning("Restart requested via /restart_server — scheduling clean exit for watchdog recovery.")
 
-    try:
-        # Attempt to reload the engine with the new configuration
-        success = engine.reload_model()
+    async def _exit_after_response():
+        await asyncio.sleep(0.3)
+        logging.shutdown()
+        os._exit(1)
 
-        if success:
-            model_info = engine.get_model_info()
-            new_model_name = model_info.get("class_name", "Unknown Model")
-            new_model_type = model_info.get("type", "unknown")
-            message = f"Model hot-swap successful. Now running: {new_model_name} ({new_model_type})"
-            logger.info(message)
-
-            # restart_needed=False because we just performed the hot-swap successfully
-            return UpdateStatusResponse(message=message, restart_needed=False)
-        else:
-            error_msg = "Model reload failed. The server may be in an inconsistent state. Check logs for details."
-            logger.error(error_msg)
-            raise HTTPException(status_code=500, detail=error_msg)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Critical error during model hot-swap: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal server error during model reload: {str(e)}",
-        )
+    asyncio.create_task(_exit_after_response())
+    return UpdateStatusResponse(
+        message="Restarting — watchdog will restore service in ~45 seconds.",
+        restart_needed=False,
+    )
 
 
 # --- UI Helper API Endpoints ---
