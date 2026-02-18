@@ -438,6 +438,8 @@ def synthesize(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        _pre_alloc_mb = torch.cuda.memory_allocated() // 1024 // 1024
+        logger.info(f"[CUDA MEM] pre-synthesis: {_pre_alloc_mb} MB allocated")
 
     try:
         # Set seed globally if a specific seed value is provided and is non-zero.
@@ -552,6 +554,8 @@ def synthesize(
             # memory allocated and contributing to cumulative fragmentation.
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            _post_alloc_mb = torch.cuda.memory_allocated() // 1024 // 1024
+            logger.info(f"[CUDA MEM] post-cleanup: {_post_alloc_mb} MB allocated")
         # Return freed glibc heap pages to the OS. Without this, Python's allocator
         # holds freed librosa/numpy pages in its pool, growing RSS ~24 MB/synthesis
         # until CUDA (unified memory) can no longer find contiguous physical blocks.

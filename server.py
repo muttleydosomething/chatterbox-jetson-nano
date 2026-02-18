@@ -3,6 +3,7 @@
 # Handles API requests for text-to-speech generation, UI serving,
 # configuration management, and file uploads.
 
+import gc
 import os
 import io
 import logging
@@ -61,6 +62,7 @@ from config import (
     get_audio_output_format,
 )
 
+import torch
 import engine  # TTS Engine interface
 from models import (  # Pydantic models
     CustomTTSRequest,
@@ -968,6 +970,9 @@ async def custom_tts_endpoint(
         )
 
     for i, chunk in enumerate(text_chunks):
+        if torch.cuda.is_available():
+            _loop_alloc_mb = torch.cuda.memory_allocated() // 1024 // 1024
+            logger.info(f"[CUDA MEM] chunk {i+1}/{len(text_chunks)} start: {_loop_alloc_mb} MB allocated")
         logger.info(f"Synthesizing chunk {i+1}/{len(text_chunks)}...")
         try:
             chunk_audio_tensor, chunk_sr_from_engine = engine.synthesize(
@@ -1036,6 +1041,17 @@ async def custom_tts_endpoint(
             # We will process the final concatenated audio clip.
             processed_audio_np = current_processed_audio_tensor.cpu().numpy().squeeze()
             all_audio_segments_np.append(processed_audio_np)
+
+            # Explicit cleanup: drop tensor references immediately so gc.collect()
+            # can free any CUDA memory still referenced via Python refcounting.
+            # engine.synthesize() already calls gc.collect()+empty_cache() in its
+            # finally block, but wav_tensor is returned to this scope and keeps an
+            # extra refcount until we explicitly del it here.
+            del chunk_audio_tensor, current_processed_audio_tensor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
         except HTTPException as http_exc:
             raise http_exc
