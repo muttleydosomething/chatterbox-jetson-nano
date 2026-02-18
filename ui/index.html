@@ -554,6 +554,113 @@
 
     <script src="script.js" defer></script>
 
+    <!-- OOM recovery: watch model-status dot, show Restart Service panel when red -->
+    <script>
+    window.addEventListener('load', function () {
+        const indicator = document.getElementById('model-status-indicator');
+        if (!indicator) return;
+
+        let panel = null;
+
+        function showPanel() {
+            if (panel) return;
+            panel = document.createElement('div');
+            panel.id = 'model-oom-panel';
+            panel.style.cssText = [
+                'margin-top:0.5rem',
+                'padding:0.6rem 0.75rem',
+                'background:#fef2f2',
+                'border:1px solid #fca5a5',
+                'border-radius:0.5rem',
+                'display:flex',
+                'align-items:center',
+                'gap:0.75rem',
+                'flex-wrap:wrap',
+                'font-size:0.875rem',
+            ].join(';');
+            panel.innerHTML = `
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"
+                    style="width:1rem;height:1rem;color:#ef4444;flex-shrink:0">
+                    <path fill-rule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28
+                    10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625
+                    L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110
+                    5zm0 9a1 1 0 100-2 1 1 0 000 2z" clip-rule="evenodd"/>
+                </svg>
+                <span style="flex:1;color:#b91c1c;">
+                    Model not loaded — CUDA OOM recovery needed.
+                </span>
+                <button id="restart-clean-btn" type="button"
+                    style="padding:0.35rem 0.8rem;background:#ef4444;color:#fff;border:none;
+                           border-radius:0.375rem;cursor:pointer;font-size:0.875rem;white-space:nowrap;
+                           font-weight:600;">
+                    Restart Service
+                </button>
+                <span id="restart-clean-status"
+                    style="font-size:0.8rem;color:#6b7280;min-width:12rem;"></span>`;
+
+            const modelStatusDiv = indicator.closest('#model-status') || indicator.parentElement;
+            modelStatusDiv.insertAdjacentElement('afterend', panel);
+
+            document.getElementById('restart-clean-btn').addEventListener('click', async function () {
+                const btn = this;
+                const status = document.getElementById('restart-clean-status');
+                btn.disabled = true;
+                btn.textContent = 'Restarting…';
+                status.textContent = 'Sending restart signal…';
+
+                try {
+                    await fetch('/api/restart_clean', { method: 'POST' });
+                } catch (_) {
+                    // Expected — server exits immediately after responding
+                }
+
+                status.textContent = 'Watchdog dropping page caches…';
+
+                // Poll until the model comes back up (~45s)
+                let elapsed = 0;
+                const poll = setInterval(async function () {
+                    elapsed += 5;
+                    try {
+                        const r = await fetch('/api/model-info');
+                        if (r.ok) {
+                            const info = await r.json();
+                            if (info.loaded) {
+                                clearInterval(poll);
+                                status.textContent = '✓ Model loaded — reloading page…';
+                                setTimeout(() => location.reload(), 1500);
+                                return;
+                            }
+                        }
+                        status.textContent = `Loading model… (${elapsed}s)`;
+                    } catch (_) {
+                        status.textContent = `Service restarting… (${elapsed}s)`;
+                    }
+                    if (elapsed >= 120) {
+                        clearInterval(poll);
+                        status.textContent = 'Taking longer than expected — check borg logs.';
+                        btn.disabled = false;
+                        btn.textContent = 'Restart Service';
+                    }
+                }, 5000);
+            });
+        }
+
+        function hidePanel() {
+            if (panel) { panel.remove(); panel = null; }
+        }
+
+        // Piggyback on script.js's existing model-info polling — it updates
+        // the status-dot class, so we just watch for the class change.
+        new MutationObserver(function () {
+            if (indicator.classList.contains('error')) {
+                showPanel();
+            } else if (indicator.classList.contains('success')) {
+                hidePanel();
+            }
+        }).observe(indicator, { attributes: true, attributeFilter: ['class'] });
+    });
+    </script>
+
     <!-- Save to NAS (permanent MP3 storage) -->
     <script>
     (function () {

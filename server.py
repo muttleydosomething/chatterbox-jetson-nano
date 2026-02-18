@@ -1339,6 +1339,29 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Clean Restart Endpoint (watchdog-driven) ---
+@app.post("/api/restart_clean", tags=["Configuration"])
+async def restart_clean_endpoint():
+    """
+    Trigger a watchdog-driven container restart. The process exits with code 1;
+    chatterbox-watchdog.service detects the non-zero exit, drops page caches,
+    then restarts the container with clean unified memory. Use this when the model
+    is stuck in the 'not loaded' state after a CUDA OOM. Takes ~45s to recover.
+    """
+    import asyncio
+    logger.warning(
+        "Clean restart requested via /api/restart_clean — scheduling exit for watchdog recovery."
+    )
+
+    async def _exit_after_response():
+        await asyncio.sleep(0.3)   # Give FastAPI time to flush the response
+        logging.shutdown()
+        os._exit(1)
+
+    asyncio.create_task(_exit_after_response())
+    return {"message": "Restarting — watchdog will restore service in ~45 seconds."}
+
+
 # --- Permanent Storage Endpoint ---
 @app.post("/api/save_permanent", tags=["Storage"])
 async def save_permanent_endpoint(
