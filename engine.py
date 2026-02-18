@@ -4,6 +4,7 @@
 import ctypes
 import gc
 import logging
+import os
 import random
 import numpy as np
 import torch
@@ -516,36 +517,20 @@ def synthesize(
     except Exception as e:
         error_str = str(e)
         if "out of memory" in error_str or ("CUDA error" in error_str and "memory" in error_str):
-            # CUDA OOM leaves the GPU context in a corrupted state — all subsequent
-            # synthesis attempts will also fail until the model is reloaded. Trigger
-            # an automatic reload to self-heal without requiring a container restart.
+            # CUDA OOM corrupts the GPU context. In-process recovery is unreliable
+            # on Jetson unified memory: the container cannot drop page caches
+            # (no SYS_ADMIN cap), so reload_model() also OOMs on fragmented RAM,
+            # and each failed attempt leaves residual heap that makes the next worse.
+            #
+            # Instead, exit with a non-zero code. chatterbox-watchdog.service detects
+            # the crash, drops page caches from the host (where SYS_ADMIN is available),
+            # then restarts the container with clean contiguous memory.
             logger.error(
-                f"CUDA out-of-memory during synthesis. Triggering automatic model reload. Error: {e}"
+                f"CUDA out-of-memory during synthesis — exiting for clean watchdog restart. "
+                f"Error: {e}"
             )
-            _turbo_voice_cache_path = None
-            _turbo_voice_cache_exag = None
-            _turbo_voice_cache_model_id = None
-            try:
-                # Drop OS page cache before reload — on Jetson unified memory,
-                # cached pages fragment physical RAM and can cause from_pretrained()
-                # to OOM even when `free` shows several GB available.
-                try:
-                    with open("/proc/sys/vm/drop_caches", "w") as f:
-                        f.write("3\n")
-                    logger.info("Dropped OS page caches before model reload.")
-                except Exception as cache_err:
-                    logger.warning(f"Could not drop page caches (may need root): {cache_err}")
-
-                success = reload_model()
-                if success:
-                    logger.info("Model reloaded successfully after CUDA OOM.")
-                else:
-                    logger.error(
-                        "Model reload after CUDA OOM failed — model is not loaded. "
-                        "Container restart required to recover."
-                    )
-            except Exception as reload_err:
-                logger.error(f"Model reload after CUDA OOM raised exception: {reload_err}")
+            logging.shutdown()
+            os._exit(1)
         else:
             logger.error(f"Error during TTS synthesis: {e}", exc_info=True)
         return None, None

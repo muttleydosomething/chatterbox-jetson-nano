@@ -8,6 +8,10 @@
 # 4. PYTORCH_NO_CUDA_MEMORY_CACHING=1 — disables caching allocator to prevent memory fragmentation
 #    on Jetson unified memory. Without this, consecutive synthesis requests fragment physical RAM
 #    causing CUDA ENOMEM after 3-4 utterances. Small speed cost, major stability gain.
+# 5. --restart no — chatterbox-watchdog.service handles crash recovery. On CUDA OOM the process
+#    exits with code 1; the watchdog drops page caches from the host (SYS_ADMIN available there)
+#    then restarts the container with clean contiguous memory. Docker's built-in restart would
+#    skip the cache drop, causing the reload to OOM on fragmented RAM and loop indefinitely.
 
 CUBLAS_HOST=/usr/local/cuda/targets/aarch64-linux/lib
 CUBLAS_CTR=/usr/local/cuda/targets/sbsa-linux/lib
@@ -16,7 +20,7 @@ CUDNN_CTR=/usr/lib/aarch64-linux-gnu
 
 docker run -d --name chatterbox-tts \
   --runtime nvidia --network host \
-  --restart unless-stopped \
+  --restart no \
   -e HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN environment variable or edit this script} \
   -e PYTHONPATH=/app/patches \
   -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 \
