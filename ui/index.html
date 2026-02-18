@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Chatterbox TTS Server</title>
+    <link rel="icon" type="image/png" href="/ui/favicon.png">
     <link rel="stylesheet" href="styles.css">
     <script src="vendor/wavesurfer.min.js"></script>
 </head>
@@ -552,6 +553,111 @@
     </div>
 
     <script src="script.js" defer></script>
+
+    <!-- Save to NAS (permanent MP3 storage) -->
+    <script>
+    (function () {
+        const container = document.getElementById('audio-player-container');
+        if (!container) return;
+
+        function injectSaveCard() {
+            // Don't inject twice
+            if (document.getElementById('save-nas-card')) return;
+
+            const card = document.createElement('div');
+            card.id = 'save-nas-card';
+            card.className = 'card mt-4';
+            card.style.cssText = 'margin-top:1rem;';
+            card.innerHTML = `
+                <div class="card__body" style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"
+                        style="width:1.25rem;height:1.25rem;flex-shrink:0;opacity:0.7;">
+                        <path d="M2 3a1 1 0 0 0-1 1v1a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1H2Z"/>
+                        <path fill-rule="evenodd" d="M2 7.5h16l-.811 7.71a2 2 0 0 1-1.99 1.79H4.802a2 2 0 0 1-1.99-1.79L2 7.5Zm5.22 1.72a.75.75 0 0 1 1.06 0L10 10.94l1.72-1.72a.75.75 0 1 1 1.06 1.06L11.06 12l1.72 1.72a.75.75 0 1 1-1.06 1.06L10 13.06l-1.72 1.72a.75.75 0 0 1-1.06-1.06L8.94 12l-1.72-1.72a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd"/>
+                    </svg>
+                    <input id="nas-title-input" type="text" placeholder="Title (e.g. Wind in the Willows - Ch1)"
+                        style="flex:1;min-width:200px;padding:0.4rem 0.6rem;border-radius:0.375rem;
+                               border:1px solid var(--border-color,#cbd5e1);background:var(--input-bg,#fff);
+                               color:inherit;font-size:0.875rem;" />
+                    <button id="save-nas-btn" type="button" class="btn secondary"
+                        style="white-space:nowrap;">
+                        Save MP3 to NAS
+                    </button>
+                    <span id="save-nas-status" style="font-size:0.8rem;opacity:0.8;"></span>
+                </div>`;
+            container.appendChild(card);
+
+            document.getElementById('save-nas-btn').addEventListener('click', async function () {
+                const btn = this;
+                const status = document.getElementById('save-nas-status');
+                const titleInput = document.getElementById('nas-title-input');
+                const downloadLink = container.querySelector('#download-link');
+
+                if (!downloadLink || !downloadLink.href || downloadLink.href === '#') {
+                    status.textContent = 'No audio to save yet.';
+                    return;
+                }
+
+                btn.disabled = true;
+                status.textContent = 'Converting & saving…';
+
+                try {
+                    // Fetch the blob from the browser-side blob URL
+                    const blobResp = await fetch(downloadLink.href);
+                    const audioBlob = await blobResp.blob();
+
+                    const title = titleInput.value.trim() ||
+                        (downloadLink.download ? downloadLink.download.replace(/\.[^.]+$/, '') : '');
+
+                    const formData = new FormData();
+                    formData.append('file', audioBlob, downloadLink.download || 'audio.wav');
+
+                    const params = title ? `?title=${encodeURIComponent(title)}` : '';
+                    const resp = await fetch(`/api/save_permanent${params}`, {
+                        method: 'POST',
+                        body: formData,
+                    });
+
+                    if (!resp.ok) {
+                        const err = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }));
+                        throw new Error(err.detail || 'Save failed');
+                    }
+
+                    const result = await resp.json();
+                    status.textContent = `✓ Saved: ${result.saved} (${result.size_kb} KB)`;
+                    btn.textContent = 'Saved ✓';
+                } catch (err) {
+                    console.error('Save to NAS error:', err);
+                    status.textContent = `✗ ${err.message}`;
+                    btn.disabled = false;
+                    btn.textContent = 'Save MP3 to NAS';
+                }
+            });
+        }
+
+        // Watch for the audio player being created/replaced by script.js
+        const observer = new MutationObserver(function (mutations) {
+            for (const m of mutations) {
+                if (m.addedNodes.length) {
+                    // script.js replaced innerHTML — re-inject our card
+                    // and reset the Save button for the new audio
+                    const existing = document.getElementById('save-nas-card');
+                    if (existing) existing.remove();
+                    // Small delay to let script.js finish populating the player
+                    setTimeout(function () {
+                        injectSaveCard();
+                        const btn = document.getElementById('save-nas-btn');
+                        const status = document.getElementById('save-nas-status');
+                        if (btn) { btn.disabled = false; btn.textContent = 'Save MP3 to NAS'; }
+                        if (status) status.textContent = '';
+                    }, 100);
+                    break;
+                }
+            }
+        });
+        observer.observe(container, { childList: true });
+    })();
+    </script>
 </body>
 
 </html>

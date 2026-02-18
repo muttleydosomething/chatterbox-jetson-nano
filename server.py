@@ -8,6 +8,7 @@ import io
 import logging
 import logging.handlers  # For RotatingFileHandler
 import shutil
+import subprocess
 import time
 import uuid
 import yaml  # For loading presets
@@ -22,6 +23,7 @@ import threading  # For automatic browser opening
 from fastapi import (
     FastAPI,
     HTTPException,
+    Query,
     Request,
     File,
     UploadFile,
@@ -73,7 +75,7 @@ from pydantic import BaseModel, Field
 class OpenAISpeechRequest(BaseModel):
     model: str
     input_: str = Field(..., alias="input")
-    voice: str
+    voice: str = "Smidgypoo.mp3"
     response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
     speed: float = 1.0
     seed: Optional[int] = None
@@ -1335,6 +1337,68 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
     except Exception as e:
         logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Permanent Storage Endpoint ---
+@app.post("/api/save_permanent", tags=["Storage"])
+async def save_permanent_endpoint(
+    title: str = Query(default="", description="Filename for the saved MP3 (without extension)"),
+    file: UploadFile = File(..., description="Audio file to save permanently (WAV or MP3)"),
+):
+    """
+    Convert an audio file to MP3 and save it to the permanent NAS folder
+    (/app/outputs/permanent → /mnt/nas/music/_tts/ on the host).
+    Returns the filename and URL of the saved MP3.
+    """
+    permanent_dir = Path("/app/outputs/permanent")
+    permanent_dir.mkdir(parents=True, exist_ok=True)
+
+    # Sanitise and default the title
+    safe_title = utils.sanitize_filename(title.strip()) if title.strip() else ""
+    if not safe_title:
+        safe_title = f"tts_{time.strftime('%Y%m%d_%H%M%S')}"
+
+    output_filename = f"{safe_title}.mp3"
+    output_path = permanent_dir / output_filename
+
+    # Write uploaded audio to a temp file for ffmpeg to read
+    tmp_input = f"/tmp/tts_perm_in_{uuid.uuid4().hex[:8]}"
+    try:
+        audio_data = await file.read()
+        with open(tmp_input, "wb") as f:
+            f.write(audio_data)
+
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", tmp_input,
+                "-codec:a", "libmp3lame", "-qscale:a", "2",
+                str(output_path),
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+
+        if result.returncode != 0:
+            err = result.stderr.decode(errors="replace")[-500:]
+            logger.error(f"ffmpeg failed for save_permanent: {err}")
+            raise HTTPException(status_code=500, detail=f"ffmpeg conversion failed: {err}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"save_permanent error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(tmp_input):
+            os.unlink(tmp_input)
+
+    size_kb = output_path.stat().st_size // 1024
+    logger.info(f"Saved permanent MP3: {output_path} ({size_kb} KB)")
+    return {
+        "saved": output_filename,
+        "url": f"/outputs/permanent/{output_filename}",
+        "size_kb": size_kb,
+    }
 
 
 # --- Main Execution ---

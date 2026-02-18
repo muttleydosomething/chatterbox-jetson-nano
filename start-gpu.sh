@@ -30,6 +30,7 @@ docker run -d --name chatterbox-tts \
   -v ~/chatterbox-jetson/server.py:/app/server.py \
   -v ~/chatterbox-jetson/engine.py:/app/engine.py \
   -v ~/chatterbox-jetson/voices:/app/voices \
+  -v /mnt/nas/music/_tts:/app/outputs/permanent \
   -v ~/chatterbox-jetson/patches:/app/patches:ro \
   -v ~/chatterbox-jetson/ui/index.html:/app/ui/index.html:ro \
   -v ~/chatterbox-jetson/ui/favicon.png:/app/ui/favicon.png:ro \
