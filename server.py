@@ -786,6 +786,37 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
     return JSONResponse(content=response_data, status_code=status_code)
 
 
+# Hard character limit per synthesis call. On Jetson Orin Nano, the T3/S3Gen
+# attention layers scale non-linearly with token count — chunks > ~150 chars
+# can push CUDA memory over the 8 GB unified memory limit (model baseline ~5.5 GB).
+# chunk_text_by_sentences() respects the user's chunk_size hint but passes
+# sentences that exceed it through as-is; this cap catches those stragglers.
+MAX_SYNTHESIS_CHARS = 150
+
+
+def _hard_split_chunk(text: str, max_chars: int) -> List[str]:
+    """Force-split text at word boundaries if it exceeds max_chars."""
+    if len(text) <= max_chars:
+        return [text]
+    words = text.split()
+    parts: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for word in words:
+        # +1 for the space between words
+        word_len = len(word) + (1 if current else 0)
+        if current and current_len + word_len > max_chars:
+            parts.append(" ".join(current))
+            current = [word]
+            current_len = len(word)
+        else:
+            current.append(word)
+            current_len += word_len
+    if current:
+        parts.append(" ".join(current))
+    return parts if parts else [text]
+
+
 # --- TTS Generation Endpoint ---
 
 
@@ -907,6 +938,23 @@ async def custom_tts_endpoint(
         )
         logger.info(f"Splitting text into chunks of size ~{chunk_size_to_use}.")
         text_chunks = utils.chunk_text_by_sentences(request.text, chunk_size_to_use)
+
+        # Hard re-split any chunks that exceed the per-synthesis memory cap.
+        # chunk_text_by_sentences() honours sentence boundaries and may produce
+        # chunks longer than chunk_size_to_use when a single sentence is long.
+        # Those oversized chunks use proportionally more CUDA attention memory and
+        # can trigger OOM on Jetson unified memory even mid-way through a run.
+        safe_chunks: List[str] = []
+        for chunk in text_chunks:
+            sub = _hard_split_chunk(chunk, MAX_SYNTHESIS_CHARS)
+            if len(sub) > 1:
+                logger.info(
+                    f"Hard-split oversized chunk ({len(chunk)} chars) "
+                    f"into {len(sub)} sub-chunks to stay within memory limit."
+                )
+            safe_chunks.extend(sub)
+        text_chunks = safe_chunks
+
         perf_monitor.record(f"Text split into {len(text_chunks)} chunks")
     else:
         text_chunks = [request.text]
