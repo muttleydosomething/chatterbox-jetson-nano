@@ -23,7 +23,6 @@ docker run -d --name chatterbox-tts \
   --restart no \
   -e HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN environment variable or edit this script} \
   -e PYTHONPATH=/app/patches \
-  -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 \
   -v chatterbox-models:/app/hf_cache \
   -v chatterbox-outputs:/app/outputs \
   -v ~/chatterbox-jetson/config.yaml:/app/config.yaml \

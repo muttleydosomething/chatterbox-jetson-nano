@@ -958,6 +958,16 @@ async def custom_tts_endpoint(
             status_code=400, detail="Text processing resulted in no usable chunks."
         )
 
+    # Warm up the PyTorch caching allocator pool before the loop starts.
+    # The caching allocator will grow this pool to fit the peak synthesis
+    # allocation on chunk 1, then REUSE the same physical pages for all
+    # subsequent chunks — NvMap sees only one large alloc/free cycle total,
+    # eliminating the fragmentation that caused OOM at chunk 25 with
+    # PYTORCH_NO_CUDA_MEMORY_CACHING=1.
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+
     for i, chunk in enumerate(text_chunks):
         if torch.cuda.is_available():
             _loop_alloc_mb = torch.cuda.memory_allocated() // 1024 // 1024
@@ -1031,16 +1041,9 @@ async def custom_tts_endpoint(
             processed_audio_np = current_processed_audio_tensor.cpu().numpy().squeeze()
             all_audio_segments_np.append(processed_audio_np)
 
-            # Explicit cleanup: drop tensor references immediately so gc.collect()
-            # can free any CUDA memory still referenced via Python refcounting.
-            # engine.synthesize() already calls gc.collect()+empty_cache() in its
-            # finally block, but wav_tensor is returned to this scope and keeps an
-            # extra refcount until we explicitly del it here.
+            # Drop local tensor references so the caching allocator can reclaim
+            # and reuse those pages for the next chunk without going back to NvMap.
             del chunk_audio_tensor, current_processed_audio_tensor
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
 
         except HTTPException as http_exc:
             raise http_exc
@@ -1048,6 +1051,16 @@ async def custom_tts_endpoint(
             error_detail = f"Error processing audio chunk {i+1}: {str(e_chunk)}"
             logger.error(error_detail, exc_info=True)
             raise HTTPException(status_code=500, detail=error_detail)
+
+    # All chunks synthesised. Return the caching allocator pool to NvMap so
+    # the next request starts with fully free physical pages.
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        _done_alloc_mb = torch.cuda.memory_allocated() // 1024 // 1024
+        _done_res_mb = torch.cuda.memory_reserved() // 1024 // 1024
+        logger.info(f"[CUDA MEM] post-loop: {_done_alloc_mb} MB allocated / {_done_res_mb} MB reserved")
 
     if not all_audio_segments_np:
         logger.error("No audio segments were successfully generated.")

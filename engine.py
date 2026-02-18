@@ -433,13 +433,17 @@ def synthesize(
         logger.error("TTS model is not loaded. Cannot synthesize audio.")
         return None, None
 
-    # Pre-synthesis memory cleanup: release any cached allocations from previous
-    # synthesis runs. On Jetson unified memory, fragmentation accumulates quickly.
+    # Pre-synthesis: collect Python cycles to drop tensor refcounts.
+    # Do NOT call empty_cache() here — the caching allocator pool from the
+    # previous chunk should be REUSED by this chunk, not returned to NvMap.
+    # empty_cache() between every chunk was the cause of NvMap fragmentation:
+    # each call returned many small blocks to NvMap, and NvMap could not
+    # coalesce them fast enough for the next large synthesis allocation.
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
         _pre_alloc_mb = torch.cuda.memory_allocated() // 1024 // 1024
-        logger.info(f"[CUDA MEM] pre-synthesis: {_pre_alloc_mb} MB allocated")
+        _pre_res_mb = torch.cuda.memory_reserved() // 1024 // 1024
+        logger.info(f"[CUDA MEM] pre-synthesis: {_pre_alloc_mb} MB allocated / {_pre_res_mb} MB reserved")
 
     try:
         # Set seed globally if a specific seed value is provided and is non-zero.
@@ -543,20 +547,16 @@ def synthesize(
         return None, None
 
     finally:
-        # Release all GPU and CPU memory after every synthesis.
+        # Post-synthesis: collect Python cycles and synchronize CUDA kernels.
+        # Do NOT call empty_cache() — pool stays warm for next chunk in the loop.
+        # Server.py calls empty_cache() once after the full chunk loop completes.
         gc.collect()
         if torch.cuda.is_available():
-            # synchronize() waits for all async CUDA kernels to finish before
-            # releasing memory. Without this, empty_cache() may not be able to
-            # free tensors still referenced by in-flight kernels, leaving CUDA
-            # memory allocated and contributing to cumulative fragmentation.
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
             _post_alloc_mb = torch.cuda.memory_allocated() // 1024 // 1024
-            logger.info(f"[CUDA MEM] post-cleanup: {_post_alloc_mb} MB allocated")
-        # Return freed glibc heap pages to the OS. Without this, Python's allocator
-        # holds freed librosa/numpy pages in its pool, growing RSS ~24 MB/synthesis
-        # until CUDA (unified memory) can no longer find contiguous physical blocks.
+            _post_res_mb = torch.cuda.memory_reserved() // 1024 // 1024
+            logger.info(f"[CUDA MEM] post-cleanup: {_post_alloc_mb} MB allocated / {_post_res_mb} MB reserved")
+        # Return freed glibc heap pages to the OS.
         _malloc_trim()
 
 
