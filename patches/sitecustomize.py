@@ -17,34 +17,48 @@ _original_irfft = torch.fft.irfft
 def _patched_stft(input, n_fft, *args, **kwargs):
     if input.is_cuda:
         device = input.device
+        cpu_in = input.cpu()
+        if cpu_in.dtype == torch.float16:
+            cpu_in = cpu_in.float()
         window = kwargs.get("window", None)
         if window is not None and window.is_cuda:
-            kwargs["window"] = window.cpu()
-        result = _original_stft(input.cpu(), n_fft, *args, **kwargs)
+            kwargs["window"] = window.cpu().float() if window.dtype == torch.float16 else window.cpu()
+        result = _original_stft(cpu_in, n_fft, *args, **kwargs)
         return result.to(device)
     return _original_stft(input, n_fft, *args, **kwargs)
 
 def _patched_istft(input, n_fft, *args, **kwargs):
     if input.is_cuda:
         device = input.device
+        cpu_in = input.cpu()
+        if cpu_in.dtype == torch.float16:
+            cpu_in = cpu_in.float()
         window = kwargs.get("window", None)
         if window is not None and window.is_cuda:
-            kwargs["window"] = window.cpu()
-        result = _original_istft(input.cpu(), n_fft, *args, **kwargs)
+            kwargs["window"] = window.cpu().float() if window.dtype == torch.float16 else window.cpu()
+        result = _original_istft(cpu_in, n_fft, *args, **kwargs)
         return result.to(device)
     return _original_istft(input, n_fft, *args, **kwargs)
 
 def _patched_rfft(input, *args, **kwargs):
     if input.is_cuda:
         device = input.device
-        result = _original_rfft(input.cpu(), *args, **kwargs)
+        cpu_in = input.cpu()
+        if cpu_in.dtype == torch.float16:
+            cpu_in = cpu_in.float()
+        result = _original_rfft(cpu_in, *args, **kwargs)
         return result.to(device)
+    if input.dtype == torch.float16:
+        return _original_rfft(input.float(), *args, **kwargs)
     return _original_rfft(input, *args, **kwargs)
 
 def _patched_irfft(input, *args, **kwargs):
     if input.is_cuda:
         device = input.device
-        result = _original_irfft(input.cpu(), *args, **kwargs)
+        cpu_in = input.cpu()
+        if cpu_in.dtype == torch.complex32 or (hasattr(torch, 'complex32') and cpu_in.dtype == torch.complex32):
+            cpu_in = cpu_in.to(torch.complex64)
+        result = _original_irfft(cpu_in, *args, **kwargs)
         return result.to(device)
     return _original_irfft(input, *args, **kwargs)
 
@@ -66,9 +80,73 @@ def _patch_llama_sdpa():
         pass
 
 
-# === FP16 Model Conversion ===
-# Monkey-patch from_pretrained to convert model to fp16 after loading.
-# Saves ~1.4GB on 8GB Jetson unified memory.
+# === Selective FP16 for Turbo Model: t3 + ve only ===
+# Model sizes:  t3=815MB fp32 / 408MB fp16 (saves 407MB)
+#               s3gen=507MB fp32 (stays fp32 — audio processing incompatible with fp16)
+#               ve=3MB fp32 / 1MB fp16 (saves 2MB)
+# Total savings: ~409MB. Free RAM: ~183MB -> ~592MB with Whisper running.
+#
+# Architecture of fp16/fp32 boundaries:
+#   ve  (fp16) -> float16 speaker embedding -> T3Cond -> t3 (fp16) OK
+#   t3  (fp16) -> integer speech tokens (no float dtype) -> s3gen OK
+#   s3gen (fp32) -> all audio processing in float32
+#
+# Two patches required:
+# 1. VoiceEncoder.forward: cuDNN LSTM requires input dtype to match weight dtype.
+#    ve.embeds_from_mels computes float32 mels but feeds them to fp16 LSTM.
+#    Fix: cast mels to model dtype (fp16) before LSTM.
+# 2. T3.prepare_conditioning: ALL T3Cond tensors must match t3's dtype.
+#    emotion_adv is created as float32 (torch.ones); speaker_emb from ve is fp16
+#    (after VoiceEncoder patch), but other paths may produce float32 tensors.
+#    Fix: cast all T3Cond tensors to t3's dtype before cond_enc.
+
+def _patch_ve_forward_dtype():
+    """Patch VoiceEncoder.forward to cast mels to model dtype before LSTM."""
+    try:
+        from chatterbox.models.voice_encoder.voice_encoder import VoiceEncoder
+    except ImportError:
+        return
+    _orig_forward = VoiceEncoder.forward
+    def _dtype_cast_forward(self, mels):
+        dtype = next(self.parameters()).dtype
+        if mels.dtype != dtype:
+            mels = mels.to(dtype)
+        return _orig_forward(self, mels)
+    VoiceEncoder.forward = _dtype_cast_forward
+
+
+def _patch_t3_cond_cast():
+    """Patch T3.prepare_conditioning to cast T3Cond tensors to model dtype."""
+    try:
+        from chatterbox.models.t3.t3 import T3
+        from chatterbox.models.t3.inference.t3_hparams import T3Cond
+    except ImportError:
+        try:
+            from chatterbox.models.t3.t3 import T3, T3Cond
+        except ImportError:
+            return
+    _orig_prepare = T3.prepare_conditioning
+    def _cast_prepare_conditioning(self, t3_cond):
+        dtype = next(self.parameters()).dtype
+        # Cast all float tensors in T3Cond to model dtype
+        speaker_emb = t3_cond.speaker_emb
+        if speaker_emb is not None and speaker_emb.dtype != dtype:
+            speaker_emb = speaker_emb.to(dtype)
+        emotion_adv = getattr(t3_cond, 'emotion_adv', None)
+        if emotion_adv is not None and isinstance(emotion_adv, torch.Tensor) and emotion_adv.dtype != dtype:
+            emotion_adv = emotion_adv.to(dtype)
+        # Rebuild T3Cond with cast tensors (handles both dataclass and namedtuple)
+        try:
+            new_cond = t3_cond.__class__(
+                speaker_emb=speaker_emb,
+                cond_prompt_speech_tokens=t3_cond.cond_prompt_speech_tokens,
+                emotion_adv=emotion_adv,
+            )
+        except Exception:
+            new_cond = t3_cond  # fallback: use original
+        return _orig_prepare(self, new_cond)
+    T3.prepare_conditioning = _cast_prepare_conditioning
+
 
 def _patch_chatterbox_fp16():
     try:
@@ -80,18 +158,15 @@ def _patch_chatterbox_fp16():
 
     @classmethod
     def _fp16_from_pretrained(cls, device):
-        # Load normally (fp32)
         model = _original_from_pretrained.__func__(cls, device)
 
-        # Convert all sub-models to fp16
+        # Apply dtype-cast patches before converting weights
+        _patch_ve_forward_dtype()
+        _patch_t3_cond_cast()
+
         model.t3 = model.t3.half()
-        model.s3gen = model.s3gen.half()
+        # model.s3gen stays fp32
         model.ve = model.ve.half()
-        if model.conds is not None:
-            for field_name in vars(model.conds):
-                val = getattr(model.conds, field_name)
-                if isinstance(val, torch.Tensor) and val.is_floating_point():
-                    setattr(model.conds, field_name, val.half())
 
         gc.collect()
         if torch.cuda.is_available():
@@ -100,17 +175,6 @@ def _patch_chatterbox_fp16():
         return model
 
     ChatterboxTurboTTS.from_pretrained = _fp16_from_pretrained
-
-    # Also wrap generate to use autocast for dtype handling
-    _original_generate = ChatterboxTurboTTS.generate
-
-    def _autocast_generate(self, *args, **kwargs):
-        if self.device == "cuda" or str(self.device).startswith("cuda"):
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                return _original_generate(self, *args, **kwargs)
-        return _original_generate(self, *args, **kwargs)
-
-    ChatterboxTurboTTS.generate = _autocast_generate
 
 
 def _patch_multilingual_fp16():
@@ -215,6 +279,7 @@ def _patch_multilingual_max_tokens():
     ChatterboxMultilingualTTS.generate = _capped_generate
 
 
+
 # Apply patches when chatterbox modules are first imported
 import importlib
 import sys
@@ -243,6 +308,7 @@ class _ChatterboxPatchFinder:
         if name == "chatterbox.tts_turbo":
             _patch_chatterbox_fp16()
             self.__class__._turbo_patched = True
+
         elif name == "chatterbox.mtl_tts":
             _patch_multilingual_fp16()
             _patch_multilingual_max_tokens()

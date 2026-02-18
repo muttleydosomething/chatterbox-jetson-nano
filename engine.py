@@ -407,6 +407,12 @@ def synthesize(
         logger.error("TTS model is not loaded. Cannot synthesize audio.")
         return None, None
 
+    # Pre-synthesis memory cleanup: release any cached allocations from previous
+    # synthesis runs. On Jetson unified memory, fragmentation accumulates quickly.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     try:
         # Set seed globally if a specific seed value is provided and is non-zero.
         if seed != 0:
@@ -449,6 +455,14 @@ def synthesize(
     except Exception as e:
         logger.error(f"Error during TTS synthesis: {e}", exc_info=True)
         return None, None
+
+    finally:
+        # Release the CUDA memory cache after every synthesis request.
+        # On Jetson (unified memory), PyTorch holds freed GPU allocations in a
+        # pool that fragments over time — this prevents the accumulation that
+        # causes CUDACachingAllocator ENOMEM failures after extended uptime.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def reload_model() -> bool:

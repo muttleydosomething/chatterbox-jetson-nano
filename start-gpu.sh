@@ -4,7 +4,10 @@
 # Fixes applied:
 # 1. Mount host Jetson-native cuBLAS/cuDNN/cuFFT (container ships SBSA builds)
 # 2. STFT/ISTFT monkey-patch for non-power-of-2 FFT sizes via sitecustomize.py
-# 3. Mount config.yaml (writable), server.py, and voices/ for runtime customization
+# 3. Mount config.yaml (writable), server.py, engine.py, and voices/ for runtime customization
+# 4. PYTORCH_NO_CUDA_MEMORY_CACHING=1 — disables caching allocator to prevent memory fragmentation
+#    on Jetson unified memory. Without this, consecutive synthesis requests fragment physical RAM
+#    causing CUDA ENOMEM after 3-4 utterances. Small speed cost, major stability gain.
 
 CUBLAS_HOST=/usr/local/cuda/targets/aarch64-linux/lib
 CUBLAS_CTR=/usr/local/cuda/targets/sbsa-linux/lib
@@ -16,10 +19,12 @@ docker run -d --name chatterbox-tts \
   --restart unless-stopped \
   -e HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN environment variable or edit this script} \
   -e PYTHONPATH=/app/patches \
+  -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 \
   -v chatterbox-models:/app/hf_cache \
   -v chatterbox-outputs:/app/outputs \
   -v ~/chatterbox-jetson/config.yaml:/app/config.yaml \
   -v ~/chatterbox-jetson/server.py:/app/server.py \
+  -v ~/chatterbox-jetson/engine.py:/app/engine.py \
   -v ~/chatterbox-jetson/voices:/app/voices \
   -v ~/chatterbox-jetson/patches:/app/patches:ro \
   -v ${CUBLAS_HOST}/libcublas.so.12.6.1.4:${CUBLAS_CTR}/libcublas.so.12.6.4.1:ro \
