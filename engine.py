@@ -526,10 +526,26 @@ def synthesize(
             _turbo_voice_cache_exag = None
             _turbo_voice_cache_model_id = None
             try:
-                reload_model()
-                logger.info("Model reloaded successfully after CUDA OOM.")
+                # Drop OS page cache before reload — on Jetson unified memory,
+                # cached pages fragment physical RAM and can cause from_pretrained()
+                # to OOM even when `free` shows several GB available.
+                try:
+                    with open("/proc/sys/vm/drop_caches", "w") as f:
+                        f.write("3\n")
+                    logger.info("Dropped OS page caches before model reload.")
+                except Exception as cache_err:
+                    logger.warning(f"Could not drop page caches (may need root): {cache_err}")
+
+                success = reload_model()
+                if success:
+                    logger.info("Model reloaded successfully after CUDA OOM.")
+                else:
+                    logger.error(
+                        "Model reload after CUDA OOM failed — model is not loaded. "
+                        "Container restart required to recover."
+                    )
             except Exception as reload_err:
-                logger.error(f"Model reload after CUDA OOM failed: {reload_err}")
+                logger.error(f"Model reload after CUDA OOM raised exception: {reload_err}")
         else:
             logger.error(f"Error during TTS synthesis: {e}", exc_info=True)
         return None, None
