@@ -177,6 +177,54 @@ def _patch_chatterbox_fp16():
     ChatterboxTurboTTS.from_pretrained = _fp16_from_pretrained
 
 
+def _patch_turbo_max_tokens():
+    """Cap Turbo T3 max_new_tokens to text length instead of hardcoded 1000.
+
+    ChatterboxTurboTTS.generate() passes max_new_tokens=1000 to T3.inference().
+    On Jetson unified memory, each autoregressive step appends to the KV cache;
+    1000 steps create a large peak CUDA allocation per chunk. After 20-30 chunks
+    the NvMap free list fragments so badly that a fresh large allocation fails even
+    when total free RAM appears sufficient (torch.cuda.memory_allocated() shows 0 MB
+    but NvMapMemAllocInternalTagged returns error 12).
+
+    Fix: scale max_new_tokens to ~4× text length, capped at 750. For a 150-char
+    chunk that is 600 tokens — well above the ~250 observed tokens per chunk —
+    whilst cutting peak KV cache size by ~40% vs the hardcoded 1000.
+
+    Applied per-call (temporary class patch) so the multilingual model's own
+    max_new_tokens values (set by _patch_multilingual_max_tokens) are unaffected.
+    """
+    try:
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
+    except ImportError:
+        return
+
+    _original_generate = ChatterboxTurboTTS.generate
+
+    def _scaled_generate(self, text, audio_prompt_path=None, **kwargs):
+        max_tokens = max(300, min(750, int(len(text) * 4)))
+
+        t3_cls = type(self.t3)
+        orig_t3_inference = t3_cls.inference
+
+        def _capped_inference(t3_self, *args, max_new_tokens=1000, **kw):
+            return orig_t3_inference(
+                t3_self, *args,
+                max_new_tokens=min(max_tokens, max_new_tokens),
+                **kw,
+            )
+
+        t3_cls.inference = _capped_inference
+        try:
+            return _original_generate(
+                self, text, audio_prompt_path=audio_prompt_path, **kwargs
+            )
+        finally:
+            t3_cls.inference = orig_t3_inference
+
+    ChatterboxTurboTTS.generate = _scaled_generate
+
+
 def _patch_multilingual_fp16():
     # NOTE: Multilingual model produces wonky audio with fp16 conversion.
     # Skip fp16 for now — runs in fp32. Uses more memory but sounds correct.
@@ -307,6 +355,7 @@ class _ChatterboxPatchFinder:
 
         if name == "chatterbox.tts_turbo":
             _patch_chatterbox_fp16()
+            _patch_turbo_max_tokens()
             self.__class__._turbo_patched = True
 
         elif name == "chatterbox.mtl_tts":

@@ -459,13 +459,11 @@ def synthesize(
 
         # Call the core model's generate method
         # Multilingual model requires language_id parameter
-        # torch.no_grad() is essential here. model.eval() changes dropout/batchnorm
-        # behaviour but does NOT disable autograd — PyTorch still builds a full
-        # computation graph for every forward pass. Across 40 chunks those graphs
-        # accumulate in CUDA memory and cause OOM well before the run completes.
-        # no_grad() prevents graph construction entirely, keeping per-synthesis
-        # CUDA overhead to the minimum needed for the forward pass tensors only.
-        with torch.no_grad():
+        # torch.inference_mode() is stronger than no_grad(): it disables autograd
+        # graph construction AND version counter tracking, allowing the runtime to
+        # skip bookkeeping that no_grad() still performs. On Jetson every avoided
+        # intermediate allocation reduces NvMap fragmentation across 40 chunks.
+        with torch.inference_mode():
             if loaded_model_type == "multilingual":
                 wav_tensor = chatterbox_model.generate(
                     text=text,
