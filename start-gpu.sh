@@ -27,6 +27,8 @@ docker run -d --name chatterbox-tts \
   -v ~/chatterbox-jetson/engine.py:/app/engine.py \
   -v ~/chatterbox-jetson/voices:/app/voices \
   -v ~/chatterbox-jetson/patches:/app/patches:ro \
+  -v ~/chatterbox-jetson/ui/index.html:/app/ui/index.html:ro \
+  -v ~/chatterbox-jetson/ui/favicon.png:/app/ui/favicon.png:ro \
   -v ${CUBLAS_HOST}/libcublas.so.12.6.1.4:${CUBLAS_CTR}/libcublas.so.12.6.4.1:ro \
   -v ${CUBLAS_HOST}/libcublasLt.so.12.6.1.4:${CUBLAS_CTR}/libcublasLt.so.12.6.4.1:ro \
   -v ${CUBLAS_HOST}/libcufft.so.11.2.6.59:${CUBLAS_CTR}/libcufft.so.11.3.0.4:ro \
