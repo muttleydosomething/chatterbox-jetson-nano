@@ -21,7 +21,7 @@ CUDNN_CTR=/usr/lib/aarch64-linux-gnu
 docker run -d --name chatterbox-tts \
   --runtime nvidia --network host \
   --restart no \
-  -e HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN environment variable or edit this script} \
+  -e HF_TOKEN=${HF_TOKEN:-hf_cached} \
   -e PYTHONPATH=/app/patches \
   -v chatterbox-models:/app/hf_cache \
   -v chatterbox-outputs:/app/outputs \
