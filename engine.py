@@ -457,41 +457,59 @@ def synthesize(
 
         # Call the core model's generate method
         # Multilingual model requires language_id parameter
-        if loaded_model_type == "multilingual":
-            wav_tensor = chatterbox_model.generate(
-                text=text,
-                language_id=language,
-                audio_prompt_path=audio_prompt_path,
-                temperature=temperature,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-            )
-        elif loaded_model_type == "turbo" and audio_prompt_path is not None:
-            # Voice conditioning cache: prepare_conditionals() runs librosa + voice
-            # encoder on every call — ~24 MB of heap churn per synthesis. Skip it
-            # when the same voice file and exaggeration are reused by passing
-            # audio_prompt_path=None so the model uses its cached self.conds.
-            cache_hit = (
-                _turbo_voice_cache_path == audio_prompt_path
-                and _turbo_voice_cache_exag == exaggeration
-                and _turbo_voice_cache_model_id == id(chatterbox_model)
-                and getattr(chatterbox_model, "conds", None) is not None
-            )
-            if cache_hit:
-                logger.info(
-                    f"Voice cache hit: reusing conditioning for '{audio_prompt_path}'"
-                )
+        # torch.no_grad() is essential here. model.eval() changes dropout/batchnorm
+        # behaviour but does NOT disable autograd — PyTorch still builds a full
+        # computation graph for every forward pass. Across 40 chunks those graphs
+        # accumulate in CUDA memory and cause OOM well before the run completes.
+        # no_grad() prevents graph construction entirely, keeping per-synthesis
+        # CUDA overhead to the minimum needed for the forward pass tensors only.
+        with torch.no_grad():
+            if loaded_model_type == "multilingual":
                 wav_tensor = chatterbox_model.generate(
                     text=text,
-                    audio_prompt_path=None,  # use cached model.conds
+                    language_id=language,
+                    audio_prompt_path=audio_prompt_path,
                     temperature=temperature,
                     exaggeration=exaggeration,
                     cfg_weight=cfg_weight,
                 )
-            else:
-                logger.info(
-                    f"Voice cache miss: computing conditioning for '{audio_prompt_path}'"
+            elif loaded_model_type == "turbo" and audio_prompt_path is not None:
+                # Voice conditioning cache: prepare_conditionals() runs librosa + voice
+                # encoder on every call — ~24 MB of heap churn per synthesis. Skip it
+                # when the same voice file and exaggeration are reused by passing
+                # audio_prompt_path=None so the model uses its cached self.conds.
+                cache_hit = (
+                    _turbo_voice_cache_path == audio_prompt_path
+                    and _turbo_voice_cache_exag == exaggeration
+                    and _turbo_voice_cache_model_id == id(chatterbox_model)
+                    and getattr(chatterbox_model, "conds", None) is not None
                 )
+                if cache_hit:
+                    logger.info(
+                        f"Voice cache hit: reusing conditioning for '{audio_prompt_path}'"
+                    )
+                    wav_tensor = chatterbox_model.generate(
+                        text=text,
+                        audio_prompt_path=None,  # use cached model.conds
+                        temperature=temperature,
+                        exaggeration=exaggeration,
+                        cfg_weight=cfg_weight,
+                    )
+                else:
+                    logger.info(
+                        f"Voice cache miss: computing conditioning for '{audio_prompt_path}'"
+                    )
+                    wav_tensor = chatterbox_model.generate(
+                        text=text,
+                        audio_prompt_path=audio_prompt_path,
+                        temperature=temperature,
+                        exaggeration=exaggeration,
+                        cfg_weight=cfg_weight,
+                    )
+                    _turbo_voice_cache_path = audio_prompt_path
+                    _turbo_voice_cache_exag = exaggeration
+                    _turbo_voice_cache_model_id = id(chatterbox_model)
+            else:
                 wav_tensor = chatterbox_model.generate(
                     text=text,
                     audio_prompt_path=audio_prompt_path,
@@ -499,17 +517,6 @@ def synthesize(
                     exaggeration=exaggeration,
                     cfg_weight=cfg_weight,
                 )
-                _turbo_voice_cache_path = audio_prompt_path
-                _turbo_voice_cache_exag = exaggeration
-                _turbo_voice_cache_model_id = id(chatterbox_model)
-        else:
-            wav_tensor = chatterbox_model.generate(
-                text=text,
-                audio_prompt_path=audio_prompt_path,
-                temperature=temperature,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-            )
 
         # The ChatterboxTTS.generate method already returns a CPU tensor.
         return wav_tensor, chatterbox_model.sr
@@ -536,9 +543,14 @@ def synthesize(
         return None, None
 
     finally:
-        # Release cached GPU and CPU memory after every synthesis.
+        # Release all GPU and CPU memory after every synthesis.
         gc.collect()
         if torch.cuda.is_available():
+            # synchronize() waits for all async CUDA kernels to finish before
+            # releasing memory. Without this, empty_cache() may not be able to
+            # free tensors still referenced by in-flight kernels, leaving CUDA
+            # memory allocated and contributing to cumulative fragmentation.
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
         # Return freed glibc heap pages to the OS. Without this, Python's allocator
         # holds freed librosa/numpy pages in its pool, growing RSS ~24 MB/synthesis
