@@ -1,6 +1,7 @@
 # File: engine.py
 # Core TTS model loading and speech generation logic.
 
+import ctypes
 import gc
 import logging
 import random
@@ -89,6 +90,29 @@ model_device: Optional[str] = (
 # Track which model type is loaded
 loaded_model_type: Optional[str] = None  # "original" or "turbo"
 loaded_model_class_name: Optional[str] = None  # "ChatterboxTTS" or "ChatterboxTurboTTS"
+
+# Voice conditioning cache for Turbo model.
+# prepare_conditionals() runs librosa + voice encoder on every synthesis — expensive and
+# causes ~24MB/synthesis of Python heap growth that eventually starves CUDA allocations.
+# Cache the last-used (path, exaggeration, model_id) so we can skip prepare_conditionals()
+# when the voice hasn't changed, passing audio_prompt_path=None to reuse model.conds.
+_turbo_voice_cache_path: Optional[str] = None
+_turbo_voice_cache_exag: Optional[float] = None
+_turbo_voice_cache_model_id: Optional[int] = None  # id(chatterbox_model) at cache time
+
+
+def _malloc_trim() -> None:
+    """Return freed glibc heap pages to the OS.
+
+    On Jetson unified memory Python's glibc allocator holds freed chunks in its
+    internal pool (causing RSS to grow ~24 MB per synthesis). malloc_trim(0) tells
+    glibc to release all free pages above the program break back to the kernel.
+    This directly reduces physical RAM pressure for CUDA allocations.
+    """
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def set_seed(seed_value: int):
@@ -402,6 +426,7 @@ def synthesize(
         or (None, None) if synthesis fails.
     """
     global chatterbox_model
+    global _turbo_voice_cache_path, _turbo_voice_cache_exag, _turbo_voice_cache_model_id
 
     if not MODEL_LOADED or chatterbox_model is None:
         logger.error("TTS model is not loaded. Cannot synthesize audio.")
@@ -440,6 +465,42 @@ def synthesize(
                 exaggeration=exaggeration,
                 cfg_weight=cfg_weight,
             )
+        elif loaded_model_type == "turbo" and audio_prompt_path is not None:
+            # Voice conditioning cache: prepare_conditionals() runs librosa + voice
+            # encoder on every call — ~24 MB of heap churn per synthesis. Skip it
+            # when the same voice file and exaggeration are reused by passing
+            # audio_prompt_path=None so the model uses its cached self.conds.
+            cache_hit = (
+                _turbo_voice_cache_path == audio_prompt_path
+                and _turbo_voice_cache_exag == exaggeration
+                and _turbo_voice_cache_model_id == id(chatterbox_model)
+                and getattr(chatterbox_model, "conds", None) is not None
+            )
+            if cache_hit:
+                logger.info(
+                    f"Voice cache hit: reusing conditioning for '{audio_prompt_path}'"
+                )
+                wav_tensor = chatterbox_model.generate(
+                    text=text,
+                    audio_prompt_path=None,  # use cached model.conds
+                    temperature=temperature,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                )
+            else:
+                logger.info(
+                    f"Voice cache miss: computing conditioning for '{audio_prompt_path}'"
+                )
+                wav_tensor = chatterbox_model.generate(
+                    text=text,
+                    audio_prompt_path=audio_prompt_path,
+                    temperature=temperature,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                )
+                _turbo_voice_cache_path = audio_prompt_path
+                _turbo_voice_cache_exag = exaggeration
+                _turbo_voice_cache_model_id = id(chatterbox_model)
         else:
             wav_tensor = chatterbox_model.generate(
                 text=text,
@@ -453,16 +514,35 @@ def synthesize(
         return wav_tensor, chatterbox_model.sr
 
     except Exception as e:
-        logger.error(f"Error during TTS synthesis: {e}", exc_info=True)
+        error_str = str(e)
+        if "out of memory" in error_str or ("CUDA error" in error_str and "memory" in error_str):
+            # CUDA OOM leaves the GPU context in a corrupted state — all subsequent
+            # synthesis attempts will also fail until the model is reloaded. Trigger
+            # an automatic reload to self-heal without requiring a container restart.
+            logger.error(
+                f"CUDA out-of-memory during synthesis. Triggering automatic model reload. Error: {e}"
+            )
+            _turbo_voice_cache_path = None
+            _turbo_voice_cache_exag = None
+            _turbo_voice_cache_model_id = None
+            try:
+                reload_model()
+                logger.info("Model reloaded successfully after CUDA OOM.")
+            except Exception as reload_err:
+                logger.error(f"Model reload after CUDA OOM failed: {reload_err}")
+        else:
+            logger.error(f"Error during TTS synthesis: {e}", exc_info=True)
         return None, None
 
     finally:
-        # Release the CUDA memory cache after every synthesis request.
-        # On Jetson (unified memory), PyTorch holds freed GPU allocations in a
-        # pool that fragments over time — this prevents the accumulation that
-        # causes CUDACachingAllocator ENOMEM failures after extended uptime.
+        # Release cached GPU and CPU memory after every synthesis.
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        # Return freed glibc heap pages to the OS. Without this, Python's allocator
+        # holds freed librosa/numpy pages in its pool, growing RSS ~24 MB/synthesis
+        # until CUDA (unified memory) can no longer find contiguous physical blocks.
+        _malloc_trim()
 
 
 def reload_model() -> bool:
@@ -475,6 +555,7 @@ def reload_model() -> bool:
         bool: True if the new model loaded successfully, False otherwise.
     """
     global chatterbox_model, MODEL_LOADED, model_device, loaded_model_type, loaded_model_class_name
+    global _turbo_voice_cache_path, _turbo_voice_cache_exag, _turbo_voice_cache_model_id
 
     logger.info("Initiating model hot-swap/reload sequence...")
 
@@ -489,16 +570,21 @@ def reload_model() -> bool:
     loaded_model_type = None
     loaded_model_class_name = None
 
-    # 3. Force Python Garbage Collection
+    # 3. Invalidate voice conditioning cache (model object will be replaced)
+    _turbo_voice_cache_path = None
+    _turbo_voice_cache_exag = None
+    _turbo_voice_cache_model_id = None
+
+    # 4. Force Python Garbage Collection
     gc.collect()
     logger.info("Python garbage collection completed.")
 
-    # 4. Clear GPU Cache (CUDA)
+    # 5. Clear GPU Cache (CUDA)
     if torch.cuda.is_available():
         logger.info("Clearing CUDA cache...")
         torch.cuda.empty_cache()
 
-    # 5. Clear GPU Cache (MPS - Apple Silicon)
+    # 6. Clear GPU Cache (MPS - Apple Silicon)
     if torch.backends.mps.is_available():
         try:
             torch.mps.empty_cache()
@@ -509,7 +595,10 @@ def reload_model() -> bool:
                 "torch.mps.empty_cache() not available in this PyTorch version."
             )
 
-    # 6. Reload model from the (now updated) configuration
+    # 7. Return freed heap pages to OS before loading new model
+    _malloc_trim()
+
+    # 8. Reload model from the (now updated) configuration
     logger.info("Memory cleared. Reloading model from updated config...")
     return load_model()
 
