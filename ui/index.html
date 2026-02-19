@@ -765,6 +765,288 @@
         observer.observe(container, { childList: true });
     })();
     </script>
+
+    <!-- Streaming TTS: intercepts long-text generation and streams chunks via SSE -->
+    <script>
+    (function () {
+        // Capture-phase listener fires before script.js's bubble-phase handler.
+        // We only intercept when split is enabled AND text is long enough to be chunked.
+        document.getElementById('generate-btn').addEventListener('click', function (e) {
+            const textEl = document.getElementById('text');
+            const chunkSlider = document.getElementById('chunk-size-slider');
+            if (!textEl) return;
+
+            const textLen = textEl.value.trim().length;
+            const chunkSize = parseInt(chunkSlider ? chunkSlider.value : '120', 10) || 120;
+
+            // Intercept all long texts — streaming handles splitting automatically
+            if (textLen <= chunkSize * 1.5) return; // let script.js handle short texts
+
+            e.stopImmediatePropagation();
+            runStreamingTTS();
+        }, true); // true = capture phase
+
+        async function runStreamingTTS() {
+            const generateBtn = document.getElementById('generate-btn');
+            const container = document.getElementById('audio-player-container');
+            if (!generateBtn || !container) return;
+
+            // --- Collect form data (mirrors getTTSFormData in script.js) ---
+            const textEl        = document.getElementById('text');
+            const tempEl        = document.getElementById('temperature');
+            const exagEl        = document.getElementById('exaggeration');
+            const cfgEl         = document.getElementById('cfg-weight');
+            const speedEl       = document.getElementById('speed-factor');
+            const seedEl        = document.getElementById('seed');
+            const langEl        = document.getElementById('language');
+            const chunkSlider   = document.getElementById('chunk-size-slider');
+            const voiceModeEl   = document.querySelector('input[name="voice_mode"]:checked');
+            const predVoiceEl   = document.getElementById('predefined-voice-select');
+            const cloneRefEl    = document.getElementById('clone-reference-select');
+
+            const voiceMode = voiceModeEl ? voiceModeEl.value : 'predefined';
+
+            const formData = {
+                text:         textEl  ? textEl.value.trim()              : '',
+                temperature:  tempEl  ? parseFloat(tempEl.value)         : 0.8,
+                exaggeration: exagEl  ? parseFloat(exagEl.value)         : 0.5,
+                cfg_weight:   cfgEl   ? parseFloat(cfgEl.value)          : 0.5,
+                speed_factor: speedEl ? parseFloat(speedEl.value)        : 1.0,
+                seed:         seedEl  ? parseInt(seedEl.value, 10)       : 0,
+                language:     langEl  ? langEl.value                     : 'en',
+                split_text:   true,     // Streaming always splits; toggle state is irrelevant
+                chunk_size:   chunkSlider ? parseInt(chunkSlider.value, 10) : 120,
+                output_format: 'wav',   // SSE chunks are always WAV
+                voice_mode:   voiceMode,
+            };
+
+            if (voiceMode === 'predefined' && predVoiceEl && predVoiceEl.value !== 'none') {
+                formData.predefined_voice_id = predVoiceEl.value;
+            } else if (voiceMode === 'clone' && cloneRefEl && cloneRefEl.value !== 'none') {
+                formData.reference_audio_filename = cloneRefEl.value;
+            }
+
+            if (!formData.text) return;
+
+            // --- Disable button and show progress UI ---
+            generateBtn.disabled = true;
+            container.innerHTML = `
+                <div id="stream-progress-card" class="card mt-4">
+                    <div class="card__body">
+                        <p id="stream-status" style="font-size:0.9rem;margin-bottom:0.5rem;">
+                            Starting streaming synthesis...
+                        </p>
+                        <div style="background:var(--border-color,#e2e8f0);border-radius:4px;height:6px;">
+                            <div id="stream-progress-bar"
+                                style="background:#6366f1;height:6px;border-radius:4px;width:0%;
+                                       transition:width 0.3s ease;"></div>
+                        </div>
+                    </div>
+                </div>`;
+
+            const statusEl    = document.getElementById('stream-status');
+            const progressBar = document.getElementById('stream-progress-bar');
+
+            // --- AudioContext (must be created inside user-gesture handler) ---
+            let audioCtx;
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                await audioCtx.resume();
+            } catch (err) {
+                if (statusEl) statusEl.textContent = 'AudioContext failed: ' + err.message;
+                generateBtn.disabled = false;
+                return;
+            }
+
+            let nextStartTime  = audioCtx.currentTime + 0.3; // 300ms initial buffer
+            const decodedBuffers = [];
+            let totalChunks    = 0;
+
+            // Natural pause between chunks — matches the non-streaming /tts crossfade path.
+            // The brain accepts a pitch reset at a silence boundary far more gracefully
+            // than at a hard mid-speech cut, which is what causes the robotic "jump" sound.
+            const INTER_CHUNK_GAP_S = 0.20; // 200ms — same target as SENTENCE_PAUSE_MS in server.py
+
+            async function processChunk(ev) {
+                const bytes = Uint8Array.from(atob(ev.audio_b64), c => c.charCodeAt(0));
+                let audioBuffer;
+                try {
+                    audioBuffer = await audioCtx.decodeAudioData(bytes.buffer);
+                } catch (err) {
+                    console.error('[Stream] decodeAudioData error:', err);
+                    return;
+                }
+
+                // --- Peak normalise each chunk to a consistent level ---
+                // Prevents jarring volume jumps when the model produces louder or quieter chunks.
+                const channelData = audioBuffer.getChannelData(0);
+                let peak = 0;
+                for (let i = 0; i < channelData.length; i++) peak = Math.max(peak, Math.abs(channelData[i]));
+                if (peak > 0.01) {
+                    const scale = 0.88 / peak; // target 88% FS — leaves a little headroom
+                    for (let i = 0; i < channelData.length; i++) channelData[i] *= scale;
+                }
+
+                // --- 10ms linear edge fades — kills clicks/pops at hard cut boundaries ---
+                const fadeSamples = Math.min(
+                    Math.round(0.01 * audioBuffer.sampleRate),
+                    Math.floor(channelData.length / 2)
+                );
+                for (let i = 0; i < fadeSamples; i++) {
+                    channelData[i] *= i / fadeSamples;                              // fade in
+                    channelData[channelData.length - 1 - i] *= i / fadeSamples;    // fade out
+                }
+
+                decodedBuffers.push(audioBuffer);
+
+                // Schedule playback; add silence gap after every chunk except the last
+                const src = audioCtx.createBufferSource();
+                src.buffer = audioBuffer;
+                src.connect(audioCtx.destination);
+                const startAt = Math.max(audioCtx.currentTime + 0.05, nextStartTime);
+                src.start(startAt);
+                const gap = (ev.chunk < totalChunks) ? INTER_CHUNK_GAP_S : 0;
+                nextStartTime = startAt + audioBuffer.duration + gap;
+
+                // Update progress bar
+                const pct = totalChunks > 0 ? Math.round((ev.chunk / totalChunks) * 100) : 0;
+                if (progressBar) progressBar.style.width = pct + '%';
+                if (statusEl) statusEl.textContent =
+                    `Synthesising chunk ${ev.chunk} of ${totalChunks} — audio playing...`;
+            }
+
+            // --- Fetch SSE stream ---
+            try {
+                const resp = await fetch('/tts-stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(formData),
+                });
+
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }));
+                    throw new Error(err.detail || `Server error: ${resp.status}`);
+                }
+
+                const reader  = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let sseBuffer  = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    sseBuffer += decoder.decode(value, { stream: true });
+                    const lines = sseBuffer.split('\n');
+                    sseBuffer = lines.pop(); // keep incomplete line
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        let ev;
+                        try { ev = JSON.parse(line.slice(6)); } catch (_) { continue; }
+
+                        if (ev.error) throw new Error(ev.error);
+                        if (ev.total !== undefined) {
+                            totalChunks = ev.total;
+                            if (statusEl) statusEl.textContent = `Synthesising ${totalChunks} chunks...`;
+                        }
+                        if (ev.done) break;
+                        if (ev.audio_b64) await processChunk(ev);
+                    }
+                }
+
+            } catch (err) {
+                console.error('[Stream] Error:', err);
+                container.innerHTML = `
+                    <div class="card mt-4">
+                        <div class="card__body">
+                            <p style="color:#ef4444;">Streaming failed: ${err.message}</p>
+                        </div>
+                    </div>`;
+                generateBtn.disabled = false;
+                return;
+            }
+
+            // --- All chunks received — assemble final WAV and show player ---
+            if (decodedBuffers.length === 0) {
+                container.innerHTML = `
+                    <div class="card mt-4">
+                        <div class="card__body"><p>No audio was generated.</p></div>
+                    </div>`;
+                generateBtn.disabled = false;
+                return;
+            }
+
+            if (statusEl) statusEl.textContent = 'Assembling final audio...';
+
+            // Merge all AudioBuffers into one Float32Array, inserting the same
+            // silence gaps that were used during live playback so the downloaded
+            // WAV matches exactly what the user heard.
+            const sr           = decodedBuffers[0].sampleRate;
+            const silenceSamples = Math.round(INTER_CHUNK_GAP_S * sr); // e.g. 4800 @ 24 kHz
+            const totalSamples = decodedBuffers.reduce((s, b) => s + b.length, 0)
+                               + silenceSamples * (decodedBuffers.length - 1);
+            const merged      = new Float32Array(totalSamples); // zero-init = silence
+            let offset        = 0;
+            for (let i = 0; i < decodedBuffers.length; i++) {
+                merged.set(decodedBuffers[i].getChannelData(0), offset);
+                offset += decodedBuffers[i].length;
+                if (i < decodedBuffers.length - 1) offset += silenceSamples; // skip silence (already zero)
+            }
+
+            // Build standard 44-byte PCM WAV header + Int16 samples
+            const wavBuffer = new ArrayBuffer(44 + totalSamples * 2);
+            const view      = new DataView(wavBuffer);
+            function writeStr(v, off, str) {
+                for (let i = 0; i < str.length; i++) v.setUint8(off + i, str.charCodeAt(i));
+            }
+            writeStr(view, 0,  'RIFF');
+            view.setUint32( 4,  36 + totalSamples * 2, true);
+            writeStr(view, 8,  'WAVE');
+            writeStr(view, 12, 'fmt ');
+            view.setUint32(16, 16,    true);  // fmt chunk size
+            view.setUint16(20,  1,    true);  // PCM
+            view.setUint16(22,  1,    true);  // mono
+            view.setUint32(24, sr,    true);  // sample rate
+            view.setUint32(28, sr * 2, true); // byte rate
+            view.setUint16(32,  2,    true);  // block align
+            view.setUint16(34, 16,    true);  // bits per sample
+            writeStr(view, 36, 'data');
+            view.setUint32(40, totalSamples * 2, true);
+
+            const samples = new Int16Array(wavBuffer, 44);
+            for (let i = 0; i < totalSamples; i++) {
+                const s = Math.max(-1, Math.min(1, merged[i]));
+                samples[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+
+            const blobUrl = URL.createObjectURL(
+                new Blob([wavBuffer], { type: 'audio/wav' })
+            );
+
+            // Replace progress card with finished audio player.
+            // The NAS-save MutationObserver detects this innerHTML replacement
+            // and auto-injects the Save MP3 card below (reads #download-link).
+            container.innerHTML = `
+                <div class="card audio-player mt-4">
+                    <div class="card__body">
+                        <h2 class="card__title">Generated Audio</h2>
+                        <audio id="stream-audio-player" controls
+                               style="width:100%;margin:0.75rem 0"></audio>
+                        <div style="display:flex;gap:0.75rem;margin-top:0.5rem;flex-wrap:wrap;">
+                            <a id="download-link" href="${blobUrl}"
+                               download="tts_stream_output.wav"
+                               class="btn secondary">Download WAV</a>
+                        </div>
+                    </div>
+                </div>`;
+
+            const audioEl = document.getElementById('stream-audio-player');
+            if (audioEl) audioEl.src = blobUrl;
+
+            generateBtn.disabled = false;
+        }
+    })();
+    </script>
 </body>
 
 </html>

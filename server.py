@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import time
 import uuid
+import base64
+import json
 import yaml  # For loading presets
 import numpy as np
 import librosa  # For potential direct use if needed, though utils.py handles most
@@ -786,15 +788,48 @@ MAX_SYNTHESIS_CHARS = 150
 
 
 def _hard_split_chunk(text: str, max_chars: int) -> List[str]:
-    """Force-split text at word boundaries if it exceeds max_chars."""
+    """
+    Force-split text that exceeds max_chars.
+
+    Split preference order (most to least natural for TTS):
+      1. Comma, semicolon, colon, em-dash — the model handles a mid-clause
+         pause far more naturally than a mid-phrase word-boundary cut.
+      2. Word boundary — fallback when no punctuation exists in the window.
+
+    The punctuation search starts at 25 % of max_chars so the first segment
+    is never pathologically short, and ends at max_chars so we never exceed
+    the memory cap.
+    """
     if len(text) <= max_chars:
         return [text]
+
+    # --- Prefer a punctuation split within the allowed window ---
+    search_window = text[:max_chars]
+    min_pos = max(1, len(search_window) // 4)  # at least 25 % in
+
+    best_pos = -1
+    # Ordered by naturalness: comma/semicolon/colon sound like genuine pauses;
+    # em-dash variants are secondary; mid-sentence period is last resort here
+    # (sentence-ending periods are already handled by chunk_text_by_sentences).
+    for punct in (',', ';', ':', ' — ', ' – ', ' - '):
+        pos = search_window.rfind(punct)
+        if pos >= min_pos:
+            split_at = pos + len(punct)
+            if split_at > best_pos:
+                best_pos = split_at
+
+    if best_pos > 0:
+        first = text[:best_pos].strip()
+        rest  = text[best_pos:].strip()
+        if first and rest:
+            return [first] + _hard_split_chunk(rest, max_chars)
+
+    # --- Fallback: word-boundary split ---
     words = text.split()
     parts: List[str] = []
     current: List[str] = []
     current_len = 0
     for word in words:
-        # +1 for the space between words
         word_len = len(word) + (1 if current else 0)
         if current and current_len + word_len > max_chars:
             parts.append(" ".join(current))
@@ -1289,6 +1324,187 @@ async def custom_tts_endpoint(
 
     return StreamingResponse(
         io.BytesIO(encoded_audio_bytes), media_type=media_type, headers=headers
+    )
+
+
+@app.post("/tts-stream", tags=["TTS Generation"], summary="Stream TTS synthesis as Server-Sent Events")
+async def tts_stream_endpoint(request: CustomTTSRequest):
+    """
+    Streams TTS synthesis as Server-Sent Events (SSE).
+
+    Each synthesised chunk is sent immediately as a base64-encoded WAV blob.
+    The browser can begin playback after the first chunk arrives, eliminating
+    the need for long HTTP timeouts on large documents.
+
+    Event format:
+      data: {"total": N}                                      (first event)
+      data: {"chunk": i, "total": N, "audio_b64": "...", "sr": 24000}
+      data: {"done": true}                                    (last event)
+      data: {"error": "message"}                              (on failure)
+    """
+    if not engine.MODEL_LOADED:
+        raise HTTPException(
+            status_code=503,
+            detail="TTS engine model is not currently loaded or available.",
+        )
+
+    # --- Resolve voice path (identical to /tts) ---
+    audio_prompt_path_for_engine: Optional[Path] = None
+    if request.voice_mode == "predefined":
+        if not request.predefined_voice_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing 'predefined_voice_id' for 'predefined' voice mode.",
+            )
+        voices_dir = get_predefined_voices_path(ensure_absolute=True)
+        potential_path = voices_dir / request.predefined_voice_id
+        if not potential_path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Predefined voice file '{request.predefined_voice_id}' not found.",
+            )
+        audio_prompt_path_for_engine = potential_path
+
+    elif request.voice_mode == "clone":
+        if not request.reference_audio_filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing 'reference_audio_filename' for 'clone' voice mode.",
+            )
+        ref_dir = get_reference_audio_path(ensure_absolute=True)
+        potential_path = ref_dir / request.reference_audio_filename
+        if not potential_path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Reference audio file '{request.reference_audio_filename}' not found.",
+            )
+        max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
+        is_valid, msg = utils.validate_reference_audio(potential_path, max_dur)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=f"Invalid reference audio: {msg}")
+        audio_prompt_path_for_engine = potential_path
+
+    # --- Split text into chunks (identical to /tts) ---
+    if request.split_text and len(request.text) > (
+        request.chunk_size * 1.5 if request.chunk_size else 120 * 1.5
+    ):
+        chunk_size_to_use = request.chunk_size if request.chunk_size is not None else 120
+        text_chunks = utils.chunk_text_by_sentences(request.text, chunk_size_to_use)
+        safe_chunks: List[str] = []
+        for chunk in text_chunks:
+            sub = _hard_split_chunk(chunk, MAX_SYNTHESIS_CHARS)
+            if len(sub) > 1:
+                logger.info(
+                    f"[STREAM] Hard-split oversized chunk ({len(chunk)} chars) "
+                    f"into {len(sub)} sub-chunks."
+                )
+            safe_chunks.extend(sub)
+        text_chunks = safe_chunks
+    else:
+        text_chunks = [request.text]
+
+    if not text_chunks:
+        raise HTTPException(status_code=400, detail="Text processing resulted in no usable chunks.")
+
+    total = len(text_chunks)
+    logger.info(f"[STREAM] Starting SSE stream: {total} chunk(s)")
+
+    async def generate():
+        yield f"data: {json.dumps({'total': total})}\n\n"
+
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # Each chunk always uses the original voice prompt.  Tail-audio conditioning
+        # (feeding synthesised output back as the next prompt) was attempted but caused
+        # voice quality degradation and accent drift — the model clones its own output,
+        # accumulating artifacts and losing the original voice anchor each iteration.
+        voice_prompt: Optional[str] = (
+            str(audio_prompt_path_for_engine) if audio_prompt_path_for_engine else None
+        )
+
+        for i, chunk in enumerate(text_chunks):
+            if torch.cuda.is_available():
+                _alloc_mb = torch.cuda.memory_allocated() // 1024 // 1024
+                logger.info(f"[STREAM CUDA MEM] chunk {i+1}/{total} start: {_alloc_mb} MB allocated")
+            logger.info(f"[STREAM] Synthesising chunk {i+1}/{total}...")
+
+            try:
+                audio_tensor, sr = engine.synthesize(
+                    text=chunk,
+                    audio_prompt_path=voice_prompt,
+                    temperature=(
+                        request.temperature
+                        if request.temperature is not None
+                        else get_gen_default_temperature()
+                    ),
+                    exaggeration=(
+                        request.exaggeration
+                        if request.exaggeration is not None
+                        else get_gen_default_exaggeration()
+                    ),
+                    cfg_weight=(
+                        request.cfg_weight
+                        if request.cfg_weight is not None
+                        else get_gen_default_cfg_weight()
+                    ),
+                    seed=(
+                        request.seed if request.seed is not None else get_gen_default_seed()
+                    ),
+                    language=(
+                        request.language
+                        if request.language is not None
+                        else get_gen_default_language()
+                    ),
+                )
+
+                if audio_tensor is None or sr is None:
+                    logger.error(f"[STREAM] Engine returned None for chunk {i+1}")
+                    yield f"data: {json.dumps({'error': f'Synthesis failed for chunk {i+1}'})}\n\n"
+                    return
+
+                audio_np = audio_tensor.cpu().numpy().squeeze()
+                del audio_tensor
+
+                wav_bytes = utils.encode_audio(
+                    audio_array=audio_np,
+                    sample_rate=sr,
+                    output_format="wav",
+                )
+                if wav_bytes is None or len(wav_bytes) < 44:
+                    logger.error(f"[STREAM] encode_audio returned invalid data for chunk {i+1}")
+                    yield f"data: {json.dumps({'error': f'Encoding failed for chunk {i+1}'})}\n\n"
+                    return
+
+                audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+                event = json.dumps({"chunk": i + 1, "total": total, "audio_b64": audio_b64, "sr": sr})
+                yield f"data: {event}\n\n"
+                logger.info(f"[STREAM] Sent chunk {i+1}/{total} ({len(wav_bytes)} bytes WAV)")
+
+            except Exception as e_chunk:
+                logger.error(f"[STREAM] Error on chunk {i+1}: {e_chunk}", exc_info=True)
+                yield f"data: {json.dumps({'error': f'Chunk {i+1} failed: {str(e_chunk)}'})}\n\n"
+                return
+
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            _done_mb = torch.cuda.memory_allocated() // 1024 // 1024
+            _done_res_mb = torch.cuda.memory_reserved() // 1024 // 1024
+            logger.info(f"[STREAM CUDA MEM] post-loop: {_done_mb} MB allocated / {_done_res_mb} MB reserved")
+
+        yield f"data: {json.dumps({'done': True})}\n\n"
+        logger.info(f"[STREAM] Stream complete: {total} chunk(s) delivered")
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Prevents Nginx from buffering the SSE stream
+        },
     )
 
 
