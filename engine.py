@@ -527,7 +527,14 @@ def synthesize(
 
     except Exception as e:
         error_str = str(e)
-        if "out of memory" in error_str or ("CUDA error" in error_str and "memory" in error_str):
+        is_cuda_oom = (
+            "out of memory" in error_str
+            or ("CUDA error" in error_str and "memory" in error_str)
+            or "INTERNAL ASSERT FAILED" in error_str          # NvMap fragmentation assert
+            or "NvMapMemAllocInternalTagged" in error_str     # NvMap ENOMEM direct
+            or "CUDACachingAllocator" in error_str            # allocator internal error
+        )
+        if is_cuda_oom:
             # CUDA OOM corrupts the GPU context. In-process recovery is unreliable
             # on Jetson unified memory: the container cannot drop page caches
             # (no SYS_ADMIN cap), so reload_model() also OOMs on fragmented RAM,

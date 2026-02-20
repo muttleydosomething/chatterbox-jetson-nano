@@ -1327,6 +1327,39 @@ async def custom_tts_endpoint(
     )
 
 
+@app.post("/api/transcode", tags=["Utilities"], summary="Convert uploaded WAV bytes to another audio format")
+async def transcode_audio(request: Request, format: str = "mp3"):
+    """
+    Accepts raw WAV bytes in the request body and returns the audio re-encoded
+    in the requested format (mp3, wav, ogg, flac).  Used by the streaming client
+    to convert the client-assembled WAV into the user's chosen output format.
+    """
+    SUPPORTED = {"mp3", "wav", "ogg", "flac"}
+    fmt = format.lower().strip()
+    if fmt not in SUPPORTED:
+        raise HTTPException(status_code=400, detail=f"Unsupported format '{fmt}'. Choose from: {SUPPORTED}")
+
+    wav_bytes = await request.body()
+    if len(wav_bytes) < 44:
+        raise HTTPException(status_code=400, detail="Request body too small to be a valid WAV file.")
+
+    try:
+        from pydub import AudioSegment
+        seg = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+        out_buf = io.BytesIO()
+        export_kwargs = {"format": fmt}
+        if fmt == "mp3":
+            export_kwargs["bitrate"] = "192k"
+        seg.export(out_buf, **export_kwargs)
+        audio_data = out_buf.getvalue()
+    except Exception as e:
+        logger.error(f"[TRANSCODE] Conversion to {fmt} failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Transcoding failed: {e}")
+
+    media_types = {"mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg", "flac": "audio/flac"}
+    return Response(content=audio_data, media_type=media_types[fmt])
+
+
 @app.post("/tts-stream", tags=["TTS Generation"], summary="Stream TTS synthesis as Server-Sent Events")
 async def tts_stream_endpoint(request: CustomTTSRequest):
     """

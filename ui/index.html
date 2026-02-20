@@ -1019,9 +1019,39 @@
                 samples[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
             }
 
-            const blobUrl = URL.createObjectURL(
-                new Blob([wavBuffer], { type: 'audio/wav' })
-            );
+            // Transcode to the user's chosen format if it isn't WAV.
+            const selectedFmt = (document.getElementById('output-format-select')?.value || 'wav').toLowerCase();
+            let downloadBlob, downloadExt;
+
+            if (selectedFmt === 'wav') {
+                downloadBlob = new Blob([wavBuffer], { type: 'audio/wav' });
+                downloadExt  = 'wav';
+            } else {
+                if (statusEl) statusEl.textContent = `Converting to ${selectedFmt.toUpperCase()}...`;
+                try {
+                    const transcodeResp = await fetch(`/api/transcode?format=${selectedFmt}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'audio/wav' },
+                        body: wavBuffer
+                    });
+                    if (transcodeResp.ok) {
+                        const converted = await transcodeResp.arrayBuffer();
+                        downloadBlob = new Blob([converted], { type: transcodeResp.headers.get('Content-Type') || 'audio/mpeg' });
+                        downloadExt  = selectedFmt;
+                    } else {
+                        // Transcode failed — fall back to WAV
+                        console.warn('[Stream] Transcode failed, falling back to WAV');
+                        downloadBlob = new Blob([wavBuffer], { type: 'audio/wav' });
+                        downloadExt  = 'wav';
+                    }
+                } catch (err) {
+                    console.warn('[Stream] Transcode error, falling back to WAV:', err);
+                    downloadBlob = new Blob([wavBuffer], { type: 'audio/wav' });
+                    downloadExt  = 'wav';
+                }
+            }
+
+            const blobUrl = URL.createObjectURL(downloadBlob);
 
             // Replace progress card with finished audio player.
             // The NAS-save MutationObserver detects this innerHTML replacement
@@ -1034,8 +1064,8 @@
                                style="width:100%;margin:0.75rem 0"></audio>
                         <div style="display:flex;gap:0.75rem;margin-top:0.5rem;flex-wrap:wrap;">
                             <a id="download-link" href="${blobUrl}"
-                               download="tts_stream_output.wav"
-                               class="btn secondary">Download WAV</a>
+                               download="tts_stream_output.${downloadExt}"
+                               class="btn secondary">Download ${downloadExt.toUpperCase()}</a>
                         </div>
                     </div>
                 </div>`;
