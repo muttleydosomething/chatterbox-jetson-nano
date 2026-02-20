@@ -56,6 +56,7 @@ from config import (
     get_gen_default_temperature,
     get_gen_default_exaggeration,
     get_gen_default_cfg_weight,
+    get_gen_default_repetition_penalty,
     get_gen_default_seed,
     get_gen_default_speed_factor,
     get_gen_default_language,
@@ -1039,6 +1040,11 @@ async def custom_tts_endpoint(
                     if request.language is not None
                     else get_gen_default_language()
                 ),
+                repetition_penalty=(
+                    request.repetition_penalty
+                    if request.repetition_penalty is not None
+                    else get_gen_default_repetition_penalty()
+                ),
             )
             perf_monitor.record(f"Engine synthesized chunk {i+1}")
 
@@ -1490,6 +1496,11 @@ async def tts_stream_endpoint(request: CustomTTSRequest):
                         if request.language is not None
                         else get_gen_default_language()
                     ),
+                    repetition_penalty=(
+                        request.repetition_penalty
+                        if request.repetition_penalty is not None
+                        else get_gen_default_repetition_penalty()
+                    ),
                 )
 
                 if audio_tensor is None or sr is None:
@@ -1580,6 +1591,7 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
             cfg_weight=get_gen_default_cfg_weight(),
             seed=seed_to_use,
             language=get_gen_default_language(),
+            repetition_penalty=get_gen_default_repetition_penalty(),
         )
 
         if audio_tensor is None or sr is None:

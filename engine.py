@@ -408,6 +408,7 @@ def synthesize(
     cfg_weight: float = 0.5,
     seed: int = 0,
     language: str = "en",
+    repetition_penalty: float = 1.35,
 ) -> Tuple[Optional[torch.Tensor], Optional[int]]:
     """
     Synthesizes audio from text using the loaded TTS model.
@@ -476,6 +477,7 @@ def synthesize(
                     temperature=temperature,
                     exaggeration=exaggeration,
                     cfg_weight=cfg_weight,
+                    repetition_penalty=repetition_penalty,
                 )
             elif loaded_model_type == "turbo" and audio_prompt_path is not None:
                 # Voice conditioning cache: prepare_conditionals() runs librosa + voice
@@ -498,6 +500,7 @@ def synthesize(
                         temperature=temperature,
                         exaggeration=exaggeration,
                         cfg_weight=cfg_weight,
+                        repetition_penalty=repetition_penalty,
                     )
                 else:
                     logger.info(
@@ -509,6 +512,7 @@ def synthesize(
                         temperature=temperature,
                         exaggeration=exaggeration,
                         cfg_weight=cfg_weight,
+                        repetition_penalty=repetition_penalty,
                     )
                     _turbo_voice_cache_path = audio_prompt_path
                     _turbo_voice_cache_exag = exaggeration
@@ -520,6 +524,7 @@ def synthesize(
                     temperature=temperature,
                     exaggeration=exaggeration,
                     cfg_weight=cfg_weight,
+                    repetition_penalty=repetition_penalty,
                 )
 
         # The ChatterboxTTS.generate method already returns a CPU tensor.

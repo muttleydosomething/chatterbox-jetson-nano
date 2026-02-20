@@ -77,6 +77,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "seed": 0,  # Random seed for generation. 0 often means random or engine default.
         "speed_factor": 1.0,  # Controls the speed of the generated speech.
         "language": "en",  # Default language for TTS.
+        "repetition_penalty": 1.35,  # Penalises repeating recent tokens. Chatterbox default is 1.2,
+                                     # raised to 1.35 to handle parallel prose (e.g. Dickens).
     },
     "audio_output": {  # Settings related to the format of generated audio.
         "format": "mp3",  # Output audio format (e.g., 'wav', 'mp3').
@@ -851,6 +853,14 @@ def get_gen_default_language() -> str:
     return config_manager.get_string(
         "generation_defaults.language",
         _get_default_from_structure("generation_defaults.language"),
+    )
+
+
+def get_gen_default_repetition_penalty() -> float:
+    """Returns the default repetition penalty for TTS generation."""
+    return config_manager.get_float(
+        "generation_defaults.repetition_penalty",
+        _get_default_from_structure("generation_defaults.repetition_penalty"),
     )
 
 

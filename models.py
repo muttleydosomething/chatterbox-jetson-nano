@@ -93,6 +93,12 @@ class CustomTTSRequest(BaseModel):
     language: Optional[str] = Field(
         None, description="Overrides default language if provided."
     )
+    repetition_penalty: Optional[float] = Field(
+        None,
+        ge=1.0,
+        le=2.0,
+        description="Penalises repeating recent tokens. Higher values reduce repetition in parallel prose. (Range: 1.0-2.0)",
+    )
 
 
 class ErrorResponse(BaseModel):
